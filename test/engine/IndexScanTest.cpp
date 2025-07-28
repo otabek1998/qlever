@@ -874,7 +874,7 @@ class IndexScanWithLazyJoin : public ::testing::TestWithParam<bool> {
   // with `second`.
   static std::pair<std::vector<Result::IdTableVocabPair>,
                    std::vector<Result::IdTableVocabPair>>
-  consumeSequentially(Result::Generator first, Result::Generator second) {
+  consumeSequentially(Result::LazyResult first, Result::LazyResult second) {
     std::vector<Result::IdTableVocabPair> firstResult;
     std::vector<Result::IdTableVocabPair> secondResult;
 
@@ -892,7 +892,7 @@ class IndexScanWithLazyJoin : public ::testing::TestWithParam<bool> {
   static std::pair<std::vector<Result::IdTableVocabPair>,
                    std::vector<Result::IdTableVocabPair>>
   consumeGenerators(
-      std::pair<Result::Generator, Result::Generator> generatorPair) {
+      std::pair<Result::LazyResult, Result::LazyResult> generatorPair) {
     std::vector<Result::IdTableVocabPair> joinSideResults;
     std::vector<Result::IdTableVocabPair> scanResults;
 
@@ -912,18 +912,34 @@ class IndexScanWithLazyJoin : public ::testing::TestWithParam<bool> {
 TEST_P(IndexScanWithLazyJoin, prefilterTablesDoesFilterCorrectly) {
   IndexScan scan = makeScan();
 
-  auto makeJoinSide = [](auto* self) -> Result::Generator {
+  auto makeJoinSide = [](auto* self) -> Result::LazyResult {
     using P = Result::IdTableVocabPair;
+    
+    auto results = std::make_shared<std::vector<P>>();
+    
     P p1{self->makeIdTable({iri("<a>"), iri("<c>")}), LocalVocab{}};
-    co_yield p1;
+    results->push_back(std::move(p1));
+    
     P p2{self->makeIdTable({iri("<c>")}), LocalVocab{}};
-    co_yield p2;
+    results->push_back(std::move(p2));
+    
     LocalVocab vocab;
     vocab.getIndexAndAddIfNotContained(LocalVocabEntry{
         ad_utility::triple_component::Literal::literalWithoutQuotes("Test")});
     P p3{self->makeIdTable({iri("<c>"), iri("<q>"), iri("<xb>")}),
          std::move(vocab)};
-    co_yield p3;
+    results->push_back(std::move(p3));
+    
+    auto state = std::make_shared<size_t>(0);
+    return Result::LazyResult{ad_utility::InputRangeFromGetCallable{
+        [results, state]() mutable -> std::optional<P> {
+          if (*state < results->size()) {
+            auto result = std::move((*results)[*state]);
+            ++(*state);
+            return result;
+          }
+          return std::nullopt;
+        }}};
   };
 
   auto [joinSideResults, scanResults] = consumeGenerators(
@@ -962,12 +978,25 @@ TEST_P(IndexScanWithLazyJoin,
   qec_ = getQec(std::move(kg));
   IndexScan scan = makeScan();
 
-  auto makeJoinSide = [](auto* self) -> Result::Generator {
+  auto makeJoinSide = [](auto* self) -> Result::LazyResult {
     using P = Result::IdTableVocabPair;
+    
+    auto results = std::make_shared<std::vector<P>>();
     P p1{self->makeIdTable({iri("<a>")}), LocalVocab{}};
-    co_yield p1;
+    results->push_back(std::move(p1));
     P p2{self->makeIdTable({iri("<b>")}), LocalVocab{}};
-    co_yield p2;
+    results->push_back(std::move(p2));
+    
+    auto state = std::make_shared<size_t>(0);
+    return Result::LazyResult{ad_utility::InputRangeFromGetCallable{
+        [results, state]() mutable -> std::optional<P> {
+          if (*state < results->size()) {
+            auto result = std::move((*results)[*state]);
+            ++(*state);
+            return result;
+          }
+          return std::nullopt;
+        }}};
   };
 
   auto [joinSideResults, scanResults] = consumeGenerators(
@@ -995,12 +1024,26 @@ TEST_P(IndexScanWithLazyJoin,
   qec_ = getQec(std::move(kg));
   IndexScan scan = makeScan();
 
-  auto makeJoinSide = []() -> Result::Generator {
+  auto makeJoinSide = []() -> Result::LazyResult {
     using P = Result::IdTableVocabPair;
+    
+    auto results = std::make_shared<std::vector<P>>();
     P p1{makeIdTableFromVector({{Id::makeFromBool(true)}}), LocalVocab{}};
-    co_yield p1;
+    results->push_back(std::move(p1));
     P p2{makeIdTableFromVector({{Id::makeFromBool(true)}}), LocalVocab{}};
-    co_yield p2;
+    results->push_back(std::move(p2));
+    
+    auto state = std::make_shared<size_t>(0);
+    
+    return Result::LazyResult{ad_utility::InputRangeFromGetCallable{
+        [results, state]() mutable -> std::optional<P> {
+          if (*state < results->size()) {
+            auto result = std::move((*results)[*state]);
+            ++(*state);
+            return result;
+          }
+          return std::nullopt;
+        }}};
   };
 
   auto [joinSideResults, scanResults] =
@@ -1014,23 +1057,36 @@ TEST_P(IndexScanWithLazyJoin,
 TEST_P(IndexScanWithLazyJoin, prefilterTablesDoesNotFilterOnUndefined) {
   IndexScan scan = makeScan();
 
-  auto makeJoinSide = [](auto* self) -> Result::Generator {
+  auto makeJoinSide = [](auto* self) -> Result::LazyResult {
     using P = Result::IdTableVocabPair;
+    
+    auto results = std::make_shared<std::vector<P>>();
     P p1{IdTable{1, makeAllocator()}, LocalVocab{}};
-    co_yield p1;
+    results->push_back(std::move(p1));
     P p2{makeIdTableFromVector({{Id::makeUndefined()}}), LocalVocab{}};
-    co_yield p2;
+    results->push_back(std::move(p2));
     P p3{makeIdTableFromVector({{Id::makeUndefined()}}), LocalVocab{}};
-    co_yield p3;
+    results->push_back(std::move(p3));
     P p4{IdTable{1, makeAllocator()}, LocalVocab{}};
-    co_yield p4;
+    results->push_back(std::move(p4));
     P p5{self->makeIdTable({iri("<a>"), iri("<c>")}), LocalVocab{}};
-    co_yield p5;
+    results->push_back(std::move(p5));
     P p6{self->makeIdTable({iri("<c>"), iri("<q>"), iri("<xb>")}),
          LocalVocab{}};
-    co_yield p6;
+    results->push_back(std::move(p6));
     P p7{IdTable{1, makeAllocator()}, LocalVocab{}};
-    co_yield p7;
+    results->push_back(std::move(p7));
+    
+    auto state = std::make_shared<size_t>(0);
+    return Result::LazyResult{ad_utility::InputRangeFromGetCallable{
+        [results, state]() mutable -> std::optional<P> {
+          if (*state < results->size()) {
+            auto result = std::move((*results)[*state]);
+            ++(*state);
+            return result;
+          }
+          return std::nullopt;
+        }}};
   };
 
   auto [_, scanResults] = consumeGenerators(
@@ -1058,10 +1114,24 @@ TEST_P(IndexScanWithLazyJoin, prefilterTablesDoesNotFilterOnUndefined) {
 TEST_P(IndexScanWithLazyJoin, prefilterTablesDoesNotFilterWithSingleUndefined) {
   IndexScan scan = makeScan();
 
-  auto makeJoinSide = []() -> Result::Generator {
+  auto makeJoinSide = []() -> Result::LazyResult {
     using P = Result::IdTableVocabPair;
+    
+    auto results = std::make_shared<std::vector<P>>();
     P p1{makeIdTableFromVector({{Id::makeUndefined()}}), LocalVocab{}};
-    co_yield p1;
+    results->push_back(std::move(p1));
+    
+    auto state = std::make_shared<size_t>(0);
+    
+    return Result::LazyResult{ad_utility::InputRangeFromGetCallable{
+        [results, state]() mutable -> std::optional<P> {
+          if (*state < results->size()) {
+            auto result = std::move((*results)[*state]);
+            ++(*state);
+            return result;
+          }
+          return std::nullopt;
+        }}};
   };
 
   auto [_, scanResults] =
@@ -1089,10 +1159,24 @@ TEST_P(IndexScanWithLazyJoin, prefilterTablesDoesNotFilterWithSingleUndefined) {
 TEST_P(IndexScanWithLazyJoin, prefilterTablesWorksWithSingleEmptyTable) {
   IndexScan scan = makeScan();
 
-  auto makeJoinSide = []() -> Result::Generator {
+  auto makeJoinSide = []() -> Result::LazyResult {
     using P = Result::IdTableVocabPair;
+    
+    auto results = std::make_shared<std::vector<P>>();
     P p{IdTable{1, makeAllocator()}, LocalVocab{}};
-    co_yield p;
+    results->push_back(std::move(p));
+    
+    auto state = std::make_shared<size_t>(0);
+    
+    return Result::LazyResult{ad_utility::InputRangeFromGetCallable{
+        [results, state]() mutable -> std::optional<P> {
+          if (*state < results->size()) {
+            auto result = std::move((*results)[*state]);
+            ++(*state);
+            return result;
+          }
+          return std::nullopt;
+        }}};
   };
 
   auto [_, scanResults] =
@@ -1105,7 +1189,9 @@ TEST_P(IndexScanWithLazyJoin, prefilterTablesWorksWithSingleEmptyTable) {
 TEST_P(IndexScanWithLazyJoin, prefilterTablesWorksWithEmptyGenerator) {
   IndexScan scan = makeScan();
 
-  auto makeJoinSide = []() -> Result::Generator { co_return; };
+  auto makeJoinSide = []() -> Result::LazyResult { 
+    return Result::LazyResult{ql::views::empty<Result::IdTableVocabPair>}; 
+  };
 
   auto [_, scanResults] =
       consumeGenerators(scan.prefilterTables(LazyResult{makeJoinSide()}, 0));
@@ -1127,11 +1213,11 @@ TEST(IndexScan, prefilterTablesWithEmptyIndexScanReturnsEmptyGenerators) {
   SparqlTripleSimple xpy{Tc{Var{"?x"}}, iri("<not_p>"), Tc{Var{"?y"}}};
   IndexScan scan{qec, Permutation::PSO, xpy};
 
-  auto makeJoinSide = []() -> Result::Generator {
+  auto makeJoinSide = []() -> Result::LazyResult {
     ADD_FAILURE()
         << "The generator should not be consumed when the IndexScan is empty."
         << std::endl;
-    co_return;
+    return Result::LazyResult{ql::views::empty<Result::IdTableVocabPair>}; 
   };
 
   auto [leftGenerator, rightGenerator] =
