@@ -13,6 +13,7 @@
 #include "engine/QueryExecutionTree.h"
 #include "index/IndexImpl.h"
 #include "parser/ParsedQuery.h"
+#include "util/Iterators.h"
 
 using std::string;
 using LazyScanMetadata = CompressedRelationReader::LazyScanMetadata;
@@ -220,10 +221,20 @@ IndexScan::makeCopyWithPrefilteredScanSpecAndBlocks(
 }
 
 // _____________________________________________________________________________
-Result::Generator IndexScan::chunkedIndexScan() const {
-  for (IdTable& idTable : getLazyScan()) {
-    co_yield {std::move(idTable), LocalVocab{}};
-  }
+Result::LazyResult IndexScan::chunkedIndexScan() const {
+  auto lazyScan = getLazyScan();
+  auto iterator = lazyScan.begin();
+  auto endIterator = lazyScan.end();
+  
+  return Result::LazyResult{ad_utility::InputRangeFromGetCallable{
+      [iterator, endIterator]() mutable -> std::optional<Result::IdTableVocabPair> {
+        if (iterator != endIterator) {
+          IdTable idTable = std::move(*iterator);
+          ++iterator;
+          return Result::IdTableVocabPair{std::move(idTable), LocalVocab{}};
+        }
+        return std::nullopt;
+      }}};
 }
 
 // _____________________________________________________________________________
@@ -551,74 +562,163 @@ struct IndexScan::SharedGeneratorState {
 };
 
 // _____________________________________________________________________________
-Result::Generator IndexScan::createPrefilteredJoinSide(
+Result::LazyResult IndexScan::createPrefilteredJoinSide(
     std::shared_ptr<SharedGeneratorState> innerState) {
-  if (innerState->hasUndef()) {
-    AD_CORRECTNESS_CHECK(innerState->prefetchedValues_.empty());
-    for (auto& value : ql::ranges::subrange{innerState->iterator_.value(),
-                                            innerState->generator_.end()}) {
-      co_yield value;
-    }
-    co_return;
-  }
-  auto& prefetchedValues = innerState->prefetchedValues_;
-  while (true) {
-    if (prefetchedValues.empty()) {
-      if (innerState->doneFetching_) {
-        co_return;
-      }
-      innerState->fetch();
-      AD_CORRECTNESS_CHECK(!prefetchedValues.empty() ||
-                           innerState->doneFetching_);
-    }
-    // Make a defensive copy of the values to avoid modification during
-    // iteration when yielding.
-    auto copy = std::move(prefetchedValues);
-    // Moving out does not necessarily clear the values, so we do it explicitly.
-    prefetchedValues.clear();
-    for (auto& value : copy) {
-      co_yield value;
-    }
-  }
+  // We need to manage state for the lambda, so we'll use a shared state struct
+  struct LambdaState {
+    std::optional<Result::LazyResult::iterator> undefIterator;
+    absl::InlinedVector<Result::IdTableVocabPair, 3> currentCopy;
+    size_t currentIndex = 0;
+    bool hasInitializedUndef = false;
+  };
+  auto lambdaState = std::make_shared<LambdaState>();
+  
+  return Result::LazyResult{ad_utility::InputRangeFromGetCallable{
+      [innerState, lambdaState]() mutable -> std::optional<Result::IdTableVocabPair> {
+        if (innerState->hasUndef()) {
+          AD_CORRECTNESS_CHECK(innerState->prefetchedValues_.empty());
+          // Handle undef case - yield remaining values from iterator
+          if (!lambdaState->hasInitializedUndef) {
+            lambdaState->undefIterator = innerState->iterator_.value();
+            lambdaState->hasInitializedUndef = true;
+          }
+          if (lambdaState->undefIterator.value() != innerState->generator_.end()) {
+            auto result = std::move(*lambdaState->undefIterator.value());
+            ++lambdaState->undefIterator.value();
+            return result;
+          }
+          return std::nullopt;
+        }
+        
+        auto& prefetchedValues = innerState->prefetchedValues_;
+        
+        // If we're in the middle of yielding from currentCopy
+        if (lambdaState->currentIndex < lambdaState->currentCopy.size()) {
+          return std::move(lambdaState->currentCopy[lambdaState->currentIndex++]);
+        }
+        
+        // Need to get new values
+        while (true) {
+          if (prefetchedValues.empty()) {
+            if (innerState->doneFetching_) {
+              return std::nullopt;
+            }
+            innerState->fetch();
+            AD_CORRECTNESS_CHECK(!prefetchedValues.empty() ||
+                                 innerState->doneFetching_);
+          }
+          
+          if (!prefetchedValues.empty()) {
+            // Make a defensive copy of the values to avoid modification during
+            // iteration when yielding.
+            lambdaState->currentCopy = std::move(prefetchedValues);
+            // Moving out does not necessarily clear the values, so we do it explicitly.
+            prefetchedValues.clear();
+            lambdaState->currentIndex = 0;
+            
+            if (!lambdaState->currentCopy.empty()) {
+              return std::move(lambdaState->currentCopy[lambdaState->currentIndex++]);
+            }
+          }
+          
+          if (innerState->doneFetching_) {
+            return std::nullopt;
+          }
+        }
+      }}};
 }
 
 // _____________________________________________________________________________
-Result::Generator IndexScan::createPrefilteredIndexScanSide(
+Result::LazyResult IndexScan::createPrefilteredIndexScanSide(
     std::shared_ptr<SharedGeneratorState> innerState) {
-  if (innerState->hasUndef()) {
-    for (auto& pair : chunkedIndexScan()) {
-      co_yield pair;
-    }
-    co_return;
-  }
-  LazyScanMetadata metadata;
-  auto& pendingBlocks = innerState->pendingBlocks_;
-  while (true) {
-    if (pendingBlocks.empty()) {
-      if (innerState->doneFetching_) {
-        metadata.numBlocksAll_ = innerState->metaBlocks_.sizeBlockMetadata_;
-        updateRuntimeInfoForLazyScan(metadata);
-        co_return;
-      }
-      innerState->fetch();
-    }
-    auto scan = getLazyScan(std::move(pendingBlocks));
-    AD_CORRECTNESS_CHECK(pendingBlocks.empty());
-    for (IdTable& idTable : scan) {
-      co_yield {std::move(idTable), LocalVocab{}};
-    }
-    metadata.aggregate(scan.details());
-  }
+  // State management for the lambda
+  struct LambdaState {
+    std::optional<Result::LazyResult> chunkedScanResult;
+    std::optional<Result::LazyResult::iterator> chunkedScanIterator;
+    LazyScanMetadata metadata;
+    std::optional<Permutation::IdTableGenerator> currentScan;
+    std::optional<Permutation::IdTableGenerator::iterator> currentScanIterator;
+    bool hasInitializedChunkedScan = false;
+    bool hasFinalized = false;
+  };
+  auto lambdaState = std::make_shared<LambdaState>();
+
+  return Result::LazyResult{ad_utility::InputRangeFromGetCallable{
+      [this, innerState, lambdaState]() mutable -> std::optional<Result::IdTableVocabPair> {
+        if (innerState->hasUndef()) {
+          // Handle undef case - yield from chunkedIndexScan
+          if (!lambdaState->hasInitializedChunkedScan) {
+            lambdaState->chunkedScanResult = chunkedIndexScan();
+            lambdaState->chunkedScanIterator = lambdaState->chunkedScanResult->begin();
+            lambdaState->hasInitializedChunkedScan = true;
+          }
+          if (lambdaState->chunkedScanIterator.value() != lambdaState->chunkedScanResult->end()) {
+            auto result = std::move(*lambdaState->chunkedScanIterator.value());
+            ++lambdaState->chunkedScanIterator.value();
+            return result;
+          }
+          return std::nullopt;
+        }
+        
+        auto& pendingBlocks = innerState->pendingBlocks_;
+        
+        // Check if we're currently iterating through a scan
+        if (lambdaState->currentScanIterator.has_value() && 
+            lambdaState->currentScanIterator.value() != lambdaState->currentScan->end()) {
+          IdTable idTable = std::move(*lambdaState->currentScanIterator.value());
+          ++lambdaState->currentScanIterator.value();
+          return Result::IdTableVocabPair{std::move(idTable), LocalVocab{}};
+        }
+        
+        // Aggregate metadata from the previous scan if it finished
+        if (lambdaState->currentScan.has_value()) {
+          lambdaState->metadata.aggregate(lambdaState->currentScan->details());
+          lambdaState->currentScan.reset();
+          lambdaState->currentScanIterator.reset();
+        }
+        
+        while (true) {
+          if (pendingBlocks.empty()) {
+            if (innerState->doneFetching_) {
+              if (!lambdaState->hasFinalized) {
+                lambdaState->metadata.numBlocksAll_ = innerState->metaBlocks_.sizeBlockMetadata_;
+                updateRuntimeInfoForLazyScan(lambdaState->metadata);
+                lambdaState->hasFinalized = true;
+              }
+              return std::nullopt;
+            }
+            innerState->fetch();
+          }
+          
+          if (!pendingBlocks.empty()) {
+            lambdaState->currentScan = getLazyScan(std::move(pendingBlocks));
+            AD_CORRECTNESS_CHECK(pendingBlocks.empty());
+            lambdaState->currentScanIterator = lambdaState->currentScan->begin();
+            
+            // Try to get the first element from this scan
+            if (lambdaState->currentScanIterator.value() != lambdaState->currentScan->end()) {
+              IdTable idTable = std::move(*lambdaState->currentScanIterator.value());
+              ++lambdaState->currentScanIterator.value();
+              return Result::IdTableVocabPair{std::move(idTable), LocalVocab{}};
+            }
+            // If scan is empty, aggregate metadata and continue
+            lambdaState->metadata.aggregate(lambdaState->currentScan->details());
+            lambdaState->currentScan.reset();
+            lambdaState->currentScanIterator.reset();
+          }
+        }
+      }}};
 }
 
 // _____________________________________________________________________________
-std::pair<Result::Generator, Result::Generator> IndexScan::prefilterTables(
+std::pair<Result::LazyResult, Result::LazyResult> IndexScan::prefilterTables(
     Result::LazyResult input, ColumnIndex joinColumn) {
   AD_CORRECTNESS_CHECK(numVariables_ <= 3 && numVariables_ > 0);
   auto metaBlocks = getMetadataForScan();
 
   if (!metaBlocks.has_value()) {
-    return {Result::Generator{}, Result::Generator{}};
+    return {Result::LazyResult{ql::views::empty<Result::IdTableVocabPair>}, 
+            Result::LazyResult{ql::views::empty<Result::IdTableVocabPair>}};
   }
   auto state = std::make_shared<SharedGeneratorState>(
       std::move(input), joinColumn, std::move(metaBlocks.value()));
